@@ -486,6 +486,137 @@ def search_by_name(query):
         print("  Nenhum ASN encontrado.")
 
 
+# ─── comparação de dois ASNs ──────────────────────────────────────────────────
+
+def show_compare(asn1_input, asn2_input):
+    a1 = _asn_num(asn1_input)
+    a2 = _asn_num(asn2_input)
+
+    print(f"\n{'═'*64}")
+    print(f"  Comparação: AS{a1}  ×  AS{a2}")
+    print(f"{'═'*64}")
+
+    # ── Detalhes lado a lado ──────────────────────────────────────
+    r1  = _ripe_asn_details(a1);  p1  = _pdb_net(a1)
+    r2  = _ripe_asn_details(a2);  p2  = _pdb_net(a2)
+
+    def _val(d_ripe, d_pdb, key_ripe, key_pdb=None):
+        v = d_ripe.get(key_ripe) or (d_pdb.get(key_pdb or key_ripe) if d_pdb else None)
+        return v or "N/A"
+
+    rows = [
+        ["Campo",            f"AS{a1}",                          f"AS{a2}"],
+        ["Nome",             r1["holder"] or p1.get("name","N/A"), r2["holder"] or p2.get("name","N/A")],
+        ["País",             r1["country"],                        r2["country"]],
+        ["RIR",              r1["rir"],                            r2["rir"]],
+        ["Alocado em",       r1["alloc_time"],                     r2["alloc_time"]],
+        ["Website",          p1.get("website") or "N/A",           p2.get("website") or "N/A"],
+        ["IRR AS-SET",       p1.get("irr_as_set") or "N/A",        p2.get("irr_as_set") or "N/A"],
+        ["Tipo de rede",     p1.get("info_type") or "N/A",         p2.get("info_type") or "N/A"],
+        ["Política de peer", p1.get("policy_general") or "N/A",    p2.get("policy_general") or "N/A"],
+        ["IPv6",             "✅" if p1.get("info_ipv6") else "❌", "✅" if p2.get("info_ipv6") else "❌"],
+        ["Fonte PeeringDB",  "✅" if p1 else "❌",                  "✅" if p2 else "❌"],
+    ]
+    print(tabulate(rows, headers="firstrow",
+                   tablefmt="fancy_grid", numalign="left", stralign="left"))
+
+    # ── Prefixos / RPKI ───────────────────────────────────────────
+    print(f"\n{'─'*64}")
+    print(f"  Prefixos")
+    print(f"{'─'*64}")
+
+    pref1 = _ripe_prefixes(a1)
+    pref2 = _ripe_prefixes(a2)
+
+    def _pfx_summary(pfxs):
+        v4 = [p for p in pfxs if not p["is_v6"]]
+        v6 = [p for p in pfxs if p["is_v6"]]
+        ok = sum(1 for p in pfxs if p["rpki"] == "valid")
+        return f"IPv4: {len(v4)}  IPv6: {len(v6)}  RPKI✅: {ok}"
+
+    rows = [
+        ["Campo",    f"AS{a1}",          f"AS{a2}"],
+        ["Prefixos", _pfx_summary(pref1), _pfx_summary(pref2)],
+    ]
+    print(tabulate(rows, headers="firstrow",
+                   tablefmt="fancy_grid", numalign="left", stralign="left"))
+
+    # ── Upstreams ─────────────────────────────────────────────────
+    print(f"\n{'─'*64}")
+    print(f"  Upstreams")
+    print(f"{'─'*64}")
+
+    up1, _ = _ripe_neighbours(a1)
+    up2, _ = _ripe_neighbours(a2)
+    set1   = {u["asn"] for u in up1}
+    set2   = {u["asn"] for u in up2}
+    common_up = sorted(set1 & set2)
+
+    rows = [["Campo", f"AS{a1}", f"AS{a2}"]]
+    rows.append(["Total upstreams", len(up1), len(up2)])
+
+    common_names = {}
+    if common_up:
+        nm = _pdb_enrich_asns(common_up)
+        common_names = {a: nm.get(a, {}).get("name", "N/A") for a in common_up}
+
+    rows.append([
+        "Upstreams em comum",
+        len(common_up),
+        ", ".join(f"AS{a}" for a in common_up[:10]) or "Nenhum",
+    ])
+    print(tabulate(rows, headers="firstrow",
+                   tablefmt="fancy_grid", numalign="left", stralign="left"))
+
+    if common_up:
+        up_rows = [[a, common_names.get(a, "N/A")] for a in common_up]
+        print(tabulate(up_rows, headers=["ASN Upstream comum", "Nome"],
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+
+    # ── IXs em comum ─────────────────────────────────────────────
+    print(f"\n{'─'*64}")
+    print(f"  Internet Exchanges em comum (PeeringDB)")
+    print(f"{'─'*64}")
+
+    pid1 = p1.get("id") if p1 else None
+    pid2 = p2.get("id") if p2 else None
+
+    ix1 = _pdb_ixs(pid1)
+    ix2 = _pdb_ixs(pid2)
+
+    # Identifica IXs em comum pelo nome do IX
+    names1 = {ix["name"] for ix in ix1 if ix["name"] != "N/A"}
+    names2 = {ix["name"] for ix in ix2 if ix["name"] != "N/A"}
+    common_ix_names = names1 & names2
+
+    if common_ix_names:
+        # Monta tabela com dados de ambos os ASNs no IX
+        ix1_map = {ix["name"]: ix for ix in ix1}
+        ix2_map = {ix["name"]: ix for ix in ix2}
+        rows = []
+        for name in sorted(common_ix_names):
+            i1 = ix1_map.get(name, {})
+            i2 = ix2_map.get(name, {})
+            rows.append([
+                name,
+                i1.get("ipv4", "N/A"),
+                i2.get("ipv4", "N/A"),
+                i1.get("ipv6", "N/A"),
+                i2.get("ipv6", "N/A"),
+                _speed_str(i1.get("speed", 0)),
+                _speed_str(i2.get("speed", 0)),
+            ])
+        print(tabulate(rows,
+                       headers=["IX", f"IPv4 AS{a1}", f"IPv4 AS{a2}",
+                                 f"IPv6 AS{a1}", f"IPv6 AS{a2}",
+                                 f"Vel. AS{a1}", f"Vel. AS{a2}"],
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+        print(f"  {len(common_ix_names)} IX(s) em comum — peering direto possível.")
+    else:
+        print(f"  AS{a1} e AS{a2} não compartilham nenhum IX no PeeringDB.")
+        print(f"  (AS{a1}: {len(ix1)} IX(s)  |  AS{a2}: {len(ix2)} IX(s))")
+
+
 # ─── lookup completo ──────────────────────────────────────────────────────────
 
 def lookup_asn(asn_input, sections=None):
@@ -525,6 +656,7 @@ Exemplos:
   bgpnr -i 15169           # Apenas Internet Exchanges
   bgpnr -f 15169           # Apenas facilities/POPs (PeeringDB)
   bgpnr --peers 15169      # Peers em IXs comuns (PeeringDB)
+  bgpnr --compare 262979 61696  # Compara dois ASNs lado a lado
         """,
     )
     parser.add_argument("asn",              nargs="?",
@@ -543,9 +675,13 @@ Exemplos:
                         help="Apenas facilities/POPs (PeeringDB)")
     parser.add_argument("--peers",           metavar="ASN",
                         help="Peers em IXs comuns (PeeringDB)")
+    parser.add_argument("--compare",         nargs=2, metavar=("ASN1", "ASN2"),
+                        help="Compara dois ASNs lado a lado (detalhes, prefixos, upstreams, IXs comuns)")
     args = parser.parse_args()
 
-    if args.search:
+    if args.compare:
+        show_compare(args.compare[0], args.compare[1])
+    elif args.search:
         search_by_name(args.search)
     elif args.prefixes:
         show_prefixes(_asn_num(args.prefixes))
