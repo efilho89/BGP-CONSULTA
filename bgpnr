@@ -16,6 +16,7 @@ Instalação:
 
 import requests
 import sys
+import time
 import argparse
 from tabulate import tabulate
 
@@ -44,14 +45,22 @@ def _ripe_get(endpoint, params=None):
         return {}
 
 
-def _pdb_get(path, params=None):
-    try:
-        r = SESSION.get(f"{PEERINGDB_BASE}{path}", params=params, timeout=20)
-        r.raise_for_status()
-        return r.json().get("data") or []
-    except requests.RequestException as e:
-        print(f"  [!] Erro PeeringDB ({path}): {e}")
-        return []
+def _pdb_get(path, params=None, max_retries=4):
+    url = f"{PEERINGDB_BASE}{path}"
+    for attempt in range(max_retries):
+        try:
+            r = SESSION.get(url, params=params, timeout=20)
+            if r.status_code == 429:
+                wait = 2 ** (attempt + 1)   # 2, 4, 8, 16 s
+                print(f"  [!] PeeringDB rate limit. Aguardando {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json().get("data") or []
+        except requests.RequestException as e:
+            if attempt == max_retries - 1:
+                print(f"  [!] Erro PeeringDB ({path}): {e}")
+    return []
 
 
 # ─── utilitários ──────────────────────────────────────────────────────────────
