@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""
+bgpnr - BGP Network Research Tool
+Autor: Rudimar Remontti + Claude AI
+
+Combina dados do BGPView e PeeringDB para análise completa de ASNs.
+
+Requisitos:
+    apt install python3-requests python3-tabulate
+
+Instalação:
+    wget https://raw.githubusercontent.com/efilho89/BGP-CONSULTA/main/bgpnr -O /usr/local/bin/bgpnr
+    chmod +x /usr/local/bin/bgpnr
+"""
+
+import requests
+import time
+import sys
+import argparse
+from tabulate import tabulate
+
+BGPVIEW_BASE  = "https://api.bgpview.io"
+PEERINGDB_BASE = "https://www.peeringdb.com/api"
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "bgpnr/2.0 (BGP Network Research Tool; github.com/efilho89/BGP-CONSULTA)",
+    "Accept":     "application/json",
+})
+
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+def _bgpview_get(path, max_retries=5):
+    url = f"{BGPVIEW_BASE}{path}"
+    for attempt in range(max_retries):
+        try:
+            resp = SESSION.get(url, timeout=20)
+            if resp.status_code == 429:
+                wait = 2 ** (attempt + 1)
+                print(f"  [!] Rate limit (BGPView). Aguardando {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") == "ok":
+                return data.get("data")
+            return None
+        except requests.RequestException as e:
+            if attempt == max_retries - 1:
+                print(f"  [!] Erro BGPView ({path}): {e}")
+    return None
+
+
+def _pdb_get(path, params=None):
+    url = f"{PEERINGDB_BASE}{path}"
+    try:
+        resp = SESSION.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+    except requests.RequestException as e:
+        print(f"  [!] Erro PeeringDB ({path}): {e}")
+        return []
+
+
+def _fmt_date(date_str):
+    """Converte '2001-02-28 00:00:00' em '28/02/2001'."""
+    if not date_str:
+        return "N/A"
+    try:
+        d = date_str.split(" ")[0].split("-")
+        return f"{d[2]}/{d[1]}/{d[0]}"
+    except Exception:
+        return date_str
+
+
+def _speed_str(mbps):
+    if not mbps:
+        return "N/A"
+    return f"{mbps / 1000:.1f} Gbps" if mbps >= 1000 else f"{mbps} Mbps"
+
+
+def _consolidate_peers(v4_list, v6_list):
+    seen = {}
+    for p in v4_list:
+        seen[p["asn"]] = {
+            "ASN":  p["asn"],
+            "Nome": p["name"],
+            "País": p.get("country_code", "N/A"),
+            "IPv4": "✅",
+            "IPv6": "❌",
+        }
+    for p in v6_list:
+        if p["asn"] in seen:
+            seen[p["asn"]]["IPv6"] = "✅"
+        else:
+            seen[p["asn"]] = {
+                "ASN":  p["asn"],
+                "Nome": p["name"],
+                "País": p.get("country_code", "N/A"),
+                "IPv4": "❌",
+                "IPv6": "✅",
+            }
+    return list(seen.values())
+
+
+# ─── display functions ─────────────────────────────────────────────────────────
+
+def show_asn_details(asn_num):
+    """Detalhes gerais do ASN (BGPView + PeeringDB)."""
+    print(f"\n{'═'*64}")
+    print(f"  AS{asn_num} — Detalhes")
+    print(f"{'═'*64}")
+
+    bgp  = _bgpview_get(f"/asn/{asn_num}") or {}
+    pdb_nets = _pdb_get("/net", {"asn": asn_num, "depth": 1})
+    pdb  = pdb_nets[0] if pdb_nets else {}
+
+    rir = bgp.get("rir_allocation") or {}
+    rows = [
+        ["AS Number",        f"AS{bgp.get('asn', asn_num)}"],
+        ["Nome",             bgp.get("name")             or pdb.get("name", "N/A")],
+        ["País",             bgp.get("country_code", "N/A")],
+        ["RIR",              rir.get("rir_name", "N/A")],
+        ["Alocado em",       _fmt_date(rir.get("date_allocated", ""))],
+        ["Website",          bgp.get("website")          or pdb.get("website", "N/A") or "N/A"],
+        ["Contatos",         ", ".join(bgp.get("email_contacts") or []) or "N/A"],
+        ["IRR AS-SET",       pdb.get("irr_as_set")       or "N/A"],
+        ["Tipo de rede",     pdb.get("info_type")        or "N/A"],
+        ["Unicast IPv4",     "✅" if pdb.get("info_unicast")   else ("❌" if pdb else "N/A")],
+        ["Multicast",        "✅" if pdb.get("info_multicast") else ("❌" if pdb else "N/A")],
+        ["IPv6",             "✅" if pdb.get("info_ipv6")      else ("❌" if pdb else "N/A")],
+        ["Política de peer", pdb.get("policy_general")   or "N/A"],
+        ["Fonte PeeringDB",  "✅" if pdb else "❌ (não cadastrado)"],
+    ]
+    print(tabulate(rows, tablefmt="fancy_grid", numalign="left", stralign="left"))
+    return bgp, pdb
+
+
+def show_prefixes(asn_num):
+    """Prefixos IPv4/IPv6 com status RPKI."""
+    print(f"\n{'─'*64}")
+    print(f"  AS{asn_num} — Prefixos  (RPKI: ✅ Válido | ❌ Inválido/Não encontrado)")
+    print(f"{'─'*64}")
+
+    data = _bgpview_get(f"/asn/{asn_num}/prefixes")
+    if not data:
+        print("  Nenhum prefixo encontrado.")
+        return
+
+    ipv4 = data.get("ipv4_prefixes", [])
+    ipv6 = data.get("ipv6_prefixes", [])
+
+    if ipv4:
+        rows = [
+            [
+                "✅" if p["roa_status"] == "Valid" else "❌",
+                p["prefix"],
+                (p.get("name") or "N/A")[:40],
+                (p.get("description") or "N/A")[:50],
+            ]
+            for p in ipv4
+        ]
+        print(tabulate(rows,
+                       headers=["RPKI", "Prefixo IPv4", "Nome", "Descrição"],
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+
+    if ipv6:
+        rows = [
+            [
+                "✅" if p["roa_status"] == "Valid" else "❌",
+                p["prefix"],
+                (p.get("name") or "N/A")[:40],
+                (p.get("description") or "N/A")[:50],
+            ]
+            for p in ipv6
+        ]
+        print(tabulate(rows,
+                       headers=["RPKI", "Prefixo IPv6", "Nome", "Descrição"],
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+
+    total = len(ipv4) + len(ipv6)
+    valid = sum(1 for p in ipv4 + ipv6 if p.get("roa_status") == "Valid")
+    print(f"  Resumo: {total} prefixo(s) — {valid} RPKI válido(s)")
+
+
+def show_upstreams(asn_num):
+    """Upstreams (trânsito) do ASN."""
+    print(f"\n{'─'*64}")
+    print(f"  AS{asn_num} — Upstreams (Trânsito)")
+    print(f"{'─'*64}")
+
+    data = _bgpview_get(f"/asn/{asn_num}/upstreams")
+    if not data:
+        print("  Nenhum upstream encontrado.")
+        return
+
+    rows = _consolidate_peers(
+        data.get("ipv4_upstreams", []),
+        data.get("ipv6_upstreams", []),
+    )
+    if rows:
+        print(tabulate(rows, headers="keys",
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+    else:
+        print("  Nenhum upstream encontrado.")
+
+
+def show_downstreams(asn_num):
+    """Downstreams (clientes) do ASN."""
+    print(f"\n{'─'*64}")
+    print(f"  AS{asn_num} — Downstreams (Clientes)")
+    print(f"{'─'*64}")
+
+    data = _bgpview_get(f"/asn/{asn_num}/downstreams")
+    if not data:
+        print("  Nenhum downstream encontrado.")
+        return
+
+    rows = _consolidate_peers(
+        data.get("ipv4_downstreams", []),
+        data.get("ipv6_downstreams", []),
+    )
+    if rows:
+        print(tabulate(rows, headers="keys",
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+    else:
+        print("  Nenhum downstream encontrado.")
+
+
+def show_ixs(asn_num, pdb_net_id=None):
+    """
+    Internet Exchanges.
+    Prioriza PeeringDB (mais detalhado: RS peer, BFD).
+    Fallback para BGPView.
+    """
+    print(f"\n{'─'*64}")
+    print(f"  AS{asn_num} — Internet Exchanges (IXs)")
+    print(f"{'─'*64}")
+
+    # — PeeringDB —
+    if pdb_net_id:
+        netixlans = _pdb_get("/netixlan", {"net_id": pdb_net_id, "depth": 2})
+        if netixlans:
+            rows = []
+            for n in netixlans:
+                ixlan = n.get("ixlan") or {}
+                ix    = ixlan.get("ix") or {}
+                # depth=2 pode expandir ixlan mas não sempre ix; tenta ambos
+                ix_name    = ix.get("name")    or ixlan.get("name") or "N/A"
+                ix_country = ix.get("country") or "N/A"
+                ix_city    = ix.get("city")    or "N/A"
+                rows.append([
+                    ix_name,
+                    ix_country,
+                    ix_city,
+                    n.get("ipaddr4") or "N/A",
+                    n.get("ipaddr6") or "N/A",
+                    _speed_str(n.get("speed")),
+                    "✅" if n.get("is_rs_peer")    else "❌",
+                    "✅" if n.get("bfd_support")   else "❌",
+                ])
+            print(tabulate(rows,
+                           headers=["IX", "País", "Cidade", "IPv4", "IPv6",
+                                    "Velocidade", "RS Peer", "BFD"],
+                           tablefmt="fancy_grid", numalign="left", stralign="left"))
+            return
+
+    # — BGPView fallback —
+    ixs = _bgpview_get(f"/asn/{asn_num}/ixs")
+    if ixs:
+        rows = [
+            [
+                ix.get("name", "N/A"),
+                ix.get("country_code", "N/A"),
+                ix.get("city", "N/A"),
+                ix.get("ipv4_address") or "N/A",
+                ix.get("ipv6_address") or "N/A",
+                _speed_str(ix.get("speed")),
+            ]
+            for ix in ixs
+        ]
+        print(tabulate(rows,
+                       headers=["IX", "País", "Cidade", "IPv4", "IPv6", "Velocidade"],
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+    else:
+        print("  Nenhum IX encontrado.")
+
+
+def show_facilities(pdb_net_id):
+    """Facilities/POPs presentes no PeeringDB."""
+    print(f"\n{'─'*64}")
+    print(f"  Facilities / Data Centers (PeeringDB)")
+    print(f"{'─'*64}")
+
+    if not pdb_net_id:
+        print("  ASN não encontrado no PeeringDB.")
+        return
+
+    netfacs = _pdb_get("/netfac", {"net_id": pdb_net_id, "depth": 2})
+    if not netfacs:
+        print("  Nenhuma facility encontrada.")
+        return
+
+    rows = []
+    for nf in netfacs:
+        fac = nf.get("fac") or {}
+        rows.append([
+            fac.get("name",     "N/A"),
+            fac.get("country",  "N/A"),
+            fac.get("city",     "N/A"),
+            fac.get("address1", "N/A"),
+        ])
+
+    print(tabulate(rows,
+                   headers=["Facility", "País", "Cidade", "Endereço"],
+                   tablefmt="fancy_grid", numalign="left", stralign="left"))
+
+
+def show_peers(asn_num, pdb_net_id=None):
+    """
+    Peers no mesmo IX (PeeringDB).
+    Lista redes que compartilham pelo menos um IX com o ASN consultado.
+    """
+    print(f"\n{'─'*64}")
+    print(f"  AS{asn_num} — Peers em IXs comuns (PeeringDB)")
+    print(f"{'─'*64}")
+
+    if not pdb_net_id:
+        print("  ASN não encontrado no PeeringDB — não é possível listar peers por IX.")
+        return
+
+    # IXLANs do ASN consultado
+    my_ixlans = _pdb_get("/netixlan", {"net_id": pdb_net_id, "fields": "ixlan_id"})
+    if not my_ixlans:
+        print("  Nenhum IX encontrado para este ASN no PeeringDB.")
+        return
+
+    ixlan_ids = list({n["ixlan_id"] for n in my_ixlans})
+
+    # Outros ASNs nesses IXLANs (até 5 ixlans para não sobrecarregar a API)
+    seen_asn  = set()
+    rows      = []
+    for ixlan_id in ixlan_ids[:5]:
+        peers = _pdb_get("/netixlan", {
+            "ixlan_id": ixlan_id,
+            "fields":   "asn,net_id",
+            "limit":    200,
+        })
+        for p in peers:
+            asn = p.get("asn")
+            if asn and asn != int(asn_num) and asn not in seen_asn:
+                seen_asn.add(asn)
+                rows.append([asn, ixlan_id])
+
+    if rows:
+        # Enriquece com nomes (em lote, até 50 ASNs)
+        sample = rows[:50]
+        asn_nums = ",".join(str(r[0]) for r in sample)
+        net_map  = {n["asn"]: n for n in _pdb_get("/net", {"asn__in": asn_nums, "fields": "asn,name,country", "limit": 100})}
+
+        enriched = []
+        for asn_v, ixlan_id in sample:
+            net = net_map.get(asn_v, {})
+            enriched.append([
+                asn_v,
+                net.get("name",    "N/A"),
+                net.get("country", "N/A"),
+            ])
+        print(tabulate(enriched,
+                       headers=["ASN Peer", "Nome", "País"],
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+        if len(rows) > 50:
+            print(f"  ... e mais {len(rows) - 50} peer(s) não exibidos.")
+    else:
+        print("  Nenhum peer encontrado nos IXs comuns.")
+
+
+def search_by_name(query):
+    """Busca ASNs por nome (BGPView + PeeringDB)."""
+    print(f"\n  Buscando ASNs para: '{query}'")
+
+    # BGPView
+    bgp_results = []
+    try:
+        resp = SESSION.get(f"{BGPVIEW_BASE}/search",
+                           params={"query_term": query}, timeout=20)
+        resp.raise_for_status()
+        d = resp.json()
+        if d.get("status") == "ok":
+            bgp_results = d.get("data", {}).get("asns", [])
+    except requests.RequestException as e:
+        print(f"  [!] Erro BGPView search: {e}")
+
+    # PeeringDB
+    pdb_results = _pdb_get("/net", {"name__contains": query, "limit": 50})
+
+    seen = {}
+    for asn in bgp_results:
+        seen[asn["asn"]] = [
+            asn["asn"],
+            asn.get("name", "N/A"),
+            asn.get("country_code", "N/A"),
+            asn.get("rir_name", "N/A"),
+            "BGPView",
+        ]
+    for net in pdb_results:
+        if net["asn"] not in seen:
+            seen[net["asn"]] = [
+                net["asn"],
+                net.get("name", "N/A"),
+                net.get("country", "N/A"),
+                "N/A",
+                "PeeringDB",
+            ]
+
+    if seen:
+        print(tabulate(list(seen.values()),
+                       headers=["ASN", "Nome", "País", "RIR", "Fonte"],
+                       tablefmt="fancy_grid", numalign="left", stralign="left"))
+    else:
+        print("  Nenhum ASN encontrado.")
+
+
+# ─── full lookup ───────────────────────────────────────────────────────────────
+
+def lookup_asn(asn_input, sections=None):
+    asn_num = asn_input.strip().upper().lstrip("AS")
+    if not asn_num.isdigit():
+        print(f"  [!] ASN inválido: '{asn_input}'")
+        return
+
+    all_sections = sections is None  # sem filtro → exibe tudo
+
+    bgp_data, pdb_net = show_asn_details(asn_num)
+    pdb_net_id = pdb_net.get("id") if pdb_net else None
+
+    if all_sections or "prefixes" in sections:
+        time.sleep(0.4)
+        show_prefixes(asn_num)
+
+    if all_sections or "upstreams" in sections:
+        time.sleep(0.4)
+        show_upstreams(asn_num)
+
+    if all_sections or "downstreams" in sections:
+        time.sleep(0.4)
+        show_downstreams(asn_num)
+
+    if all_sections or "ixs" in sections:
+        time.sleep(0.4)
+        show_ixs(asn_num, pdb_net_id)
+
+    if all_sections or "facilities" in sections:
+        show_facilities(pdb_net_id)
+
+    if all_sections or "peers" in sections:
+        show_peers(asn_num, pdb_net_id)
+
+
+# ─── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="bgpnr",
+        description="bgpnr — BGP Network Research Tool (BGPView + PeeringDB)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemplos:
+  bgpnr 15169              # Consulta completa do AS15169 (Google)
+  bgpnr AS1916             # Aceita formato AS+número
+  bgpnr -s Claro           # Busca ASNs pelo nome
+  bgpnr -p 15169           # Apenas prefixos + status RPKI
+  bgpnr -u 15169           # Apenas upstreams (trânsito)
+  bgpnr -d 15169           # Apenas downstreams (clientes)
+  bgpnr -i 15169           # Apenas Internet Exchanges
+  bgpnr -f 15169           # Apenas facilities/POPs (PeeringDB)
+  bgpnr --peers 15169      # Peers em IXs comuns (PeeringDB)
+        """,
+    )
+
+    parser.add_argument("asn",          nargs="?",
+                        help="ASN para consulta completa (ex: 15169 ou AS15169)")
+    parser.add_argument("-s", "--search",    metavar="NOME",
+                        help="Busca ASNs por nome")
+    parser.add_argument("-p", "--prefixes",  metavar="ASN",
+                        help="Apenas prefixos IPv4/IPv6 com status RPKI")
+    parser.add_argument("-u", "--upstreams", metavar="ASN",
+                        help="Apenas upstreams (provedores de trânsito)")
+    parser.add_argument("-d", "--downstreams", metavar="ASN",
+                        help="Apenas downstreams (ASNs clientes)")
+    parser.add_argument("-i", "--ixs",       metavar="ASN",
+                        help="Apenas Internet Exchanges")
+    parser.add_argument("-f", "--facilities", metavar="ASN",
+                        help="Apenas facilities/POPs (PeeringDB)")
+    parser.add_argument("--peers",           metavar="ASN",
+                        help="Peers em IXs comuns (PeeringDB)")
+
+    args = parser.parse_args()
+
+    if args.search:
+        search_by_name(args.search)
+
+    elif args.prefixes:
+        show_prefixes(args.prefixes.strip().upper().lstrip("AS"))
+
+    elif args.upstreams:
+        show_upstreams(args.upstreams.strip().upper().lstrip("AS"))
+
+    elif args.downstreams:
+        show_downstreams(args.downstreams.strip().upper().lstrip("AS"))
+
+    elif args.ixs:
+        asn_num  = args.ixs.strip().upper().lstrip("AS")
+        pdb_nets = _pdb_get("/net", {"asn": asn_num, "depth": 1})
+        pdb_id   = pdb_nets[0].get("id") if pdb_nets else None
+        show_ixs(asn_num, pdb_id)
+
+    elif args.facilities:
+        asn_num  = args.facilities.strip().upper().lstrip("AS")
+        pdb_nets = _pdb_get("/net", {"asn": asn_num, "depth": 1})
+        pdb_id   = pdb_nets[0].get("id") if pdb_nets else None
+        show_facilities(pdb_id)
+
+    elif args.peers:
+        asn_num  = args.peers.strip().upper().lstrip("AS")
+        pdb_nets = _pdb_get("/net", {"asn": asn_num, "depth": 1})
+        pdb_id   = pdb_nets[0].get("id") if pdb_nets else None
+        show_peers(asn_num, pdb_id)
+
+    elif args.asn:
+        lookup_asn(args.asn)
+
+    else:
+        # modo interativo
+        entrada = input("Insira um ASN (ex.: 15169 ou AS15169) ou nome para pesquisar: ").strip()
+        if not entrada:
+            parser.print_help()
+            sys.exit(0)
+        if entrada.isdigit() or entrada.upper().startswith("AS"):
+            lookup_asn(entrada)
+        else:
+            search_by_name(entrada)
+
+
+if __name__ == "__main__":
+    main()
