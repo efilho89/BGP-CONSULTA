@@ -409,8 +409,9 @@ def show_facilities(pdb_net_id):
 
 
 def show_peers(asn_num, pdb_net_id=None):
+    """Lista todos os peers de um ASN nos IXs (PeeringDB)."""
     print(f"\n{'─'*64}")
-    print(f"  AS{asn_num} — Peers em IXs comuns (PeeringDB)")
+    print(f"  AS{asn_num} — Peers em IXs (PeeringDB)")
     print(f"{'─'*64}")
 
     if not pdb_net_id:
@@ -443,6 +444,80 @@ def show_peers(asn_num, pdb_net_id=None):
                    tablefmt="fancy_grid", numalign="left", stralign="left"))
     if len(peer_asns) > 50:
         print(f"  ... e mais {len(peer_asns) - 50} peer(s).")
+
+
+def show_check_peering(asn1_input, asn2_input):
+    """
+    Verifica se dois ASNs peeream diretamente em algum IX (PeeringDB).
+    Uso: bgpnr --peers ASN1 ASN2
+    """
+    a1 = _asn_num(asn1_input)
+    a2 = _asn_num(asn2_input)
+
+    print(f"\n{'═'*64}")
+    print(f"  Verificando peering direto: AS{a1}  ×  AS{a2}")
+    print(f"{'═'*64}")
+
+    p1 = _pdb_net(a1)
+    p2 = _pdb_net(a2)
+
+    if not p1:
+        print(f"  [!] AS{a1} não encontrado no PeeringDB.")
+        return
+    if not p2:
+        print(f"  [!] AS{a2} não encontrado no PeeringDB.")
+        return
+
+    # IXlans de cada ASN
+    ix1_list = _pdb_get("/netixlan", {"net_id": p1["id"]})
+    ix2_list = _pdb_get("/netixlan", {"net_id": p2["id"]})
+
+    ixlan_ids_1 = {n["ixlan_id"] for n in ix1_list}
+    ixlan_ids_2 = {n["ixlan_id"] for n in ix2_list}
+    common_ixlan_ids = ixlan_ids_1 & ixlan_ids_2
+
+    if not common_ixlan_ids:
+        print(f"\n  ❌  AS{a1} e AS{a2} NÃO estão presentes em nenhum IX em comum.")
+        print(f"      AS{a1}: {len(ixlan_ids_1)} IX(s)  |  AS{a2}: {len(ixlan_ids_2)} IX(s)")
+        return
+
+    # Busca nomes dos IXs em comum
+    ixlan_map = {
+        il["id"]: il
+        for il in _pdb_get("/ixlan", {"id__in": ",".join(str(i) for i in common_ixlan_ids)})
+    }
+    ix_ids = list({str(il["ix_id"]) for il in ixlan_map.values() if il.get("ix_id")})
+    ix_map = {ix["id"]: ix for ix in _pdb_get("/ix", {"id__in": ",".join(ix_ids)})} if ix_ids else {}
+
+    # Indexa sessões por ixlan_id para buscar IPs
+    sess1 = {n["ixlan_id"]: n for n in ix1_list}
+    sess2 = {n["ixlan_id"]: n for n in ix2_list}
+
+    print(f"\n  ✅  AS{a1} e AS{a2} estão presentes em {len(common_ixlan_ids)} IX(s) em comum:\n")
+
+    rows = []
+    for ixlan_id in sorted(common_ixlan_ids):
+        ixlan = ixlan_map.get(ixlan_id, {})
+        ix    = ix_map.get(ixlan.get("ix_id"), {})
+        s1    = sess1.get(ixlan_id, {})
+        s2    = sess2.get(ixlan_id, {})
+        rows.append([
+            ix.get("name") or ixlan.get("name") or "N/A",
+            ix.get("country", "N/A"),
+            s1.get("ipaddr4") or "N/A",
+            s2.get("ipaddr4") or "N/A",
+            s1.get("ipaddr6") or "N/A",
+            s2.get("ipaddr6") or "N/A",
+            _speed_str(s1.get("speed", 0)),
+            _speed_str(s2.get("speed", 0)),
+        ])
+
+    print(tabulate(rows,
+                   headers=["IX", "País",
+                             f"IPv4 AS{a1}", f"IPv4 AS{a2}",
+                             f"IPv6 AS{a1}", f"IPv6 AS{a2}",
+                             f"Vel. AS{a1}", f"Vel. AS{a2}"],
+                   tablefmt="fancy_grid", numalign="left", stralign="left"))
 
 
 def search_by_name(query):
@@ -673,8 +748,8 @@ Exemplos:
                         help="Apenas Internet Exchanges (PeeringDB)")
     parser.add_argument("-f", "--facilities", metavar="ASN",
                         help="Apenas facilities/POPs (PeeringDB)")
-    parser.add_argument("--peers",           metavar="ASN",
-                        help="Peers em IXs comuns (PeeringDB)")
+    parser.add_argument("--peers",           nargs="+", metavar="ASN",
+                        help="1 ASN: lista todos os peers nos IXs  |  2 ASNs: verifica peering direto entre eles")
     parser.add_argument("--compare",         nargs=2, metavar=("ASN1", "ASN2"),
                         help="Compara dois ASNs lado a lado (detalhes, prefixos, upstreams, IXs comuns)")
     args = parser.parse_args()
@@ -696,8 +771,11 @@ Exemplos:
         n = _asn_num(args.facilities)
         show_facilities(_pdb_net(n).get("id"))
     elif args.peers:
-        n = _asn_num(args.peers)
-        show_peers(n, _pdb_net(n).get("id"))
+        if len(args.peers) == 2:
+            show_check_peering(args.peers[0], args.peers[1])
+        else:
+            n = _asn_num(args.peers[0])
+            show_peers(n, _pdb_net(n).get("id"))
     elif args.asn:
         lookup_asn(args.asn)
     else:
