@@ -161,10 +161,32 @@ def _pdb_enrich_asns(asn_list):
 
 # ─── RIPE Stat — lookups ───────────────────────────────────────────────────────
 
+def _rdap_alloc_date(asn_num):
+    """
+    Data de alocação via RDAP (rdap.org → redireciona para o RIR correto).
+    Funciona para LACNIC, RIPE, ARIN, APNIC e AFRINIC.
+    Usa Accept: application/rdap+json (obrigatório pelo protocolo RDAP).
+    """
+    try:
+        r = SESSION.get(
+            f"https://rdap.org/autnum/{asn_num}",
+            timeout=15,
+            allow_redirects=True,
+            headers={"Accept": "application/rdap+json"},
+        )
+        r.raise_for_status()
+        for event in r.json().get("events", []):
+            if event.get("eventAction") == "registration":
+                return _fmt_date(event.get("eventDate", ""))
+    except Exception:
+        pass
+    return "N/A"
+
+
 def _ripe_asn_details(asn_num):
-    """Combina as-overview + rir + rir-stats-country para montar os detalhes do ASN."""
-    overview    = _ripe_get("as-overview",     {"resource": f"AS{asn_num}"})
-    rir_data    = _ripe_get("rir",             {"resource": f"AS{asn_num}"})
+    """Combina as-overview + rir + rir-stats-country + RDAP para montar os detalhes do ASN."""
+    overview     = _ripe_get("as-overview",      {"resource": f"AS{asn_num}"})
+    rir_data     = _ripe_get("rir",              {"resource": f"AS{asn_num}"})
     country_data = _ripe_get("rir-stats-country", {"resource": f"AS{asn_num}"})
 
     # País via rir-stats-country → located_resources[0].location
@@ -172,19 +194,11 @@ def _ripe_asn_details(asn_num):
     country = located[0].get("location", "N/A").upper() if located else "N/A"
 
     # RIR via rir → rirs[0].rir
-    rirs = rir_data.get("rirs", [])
+    rirs     = rir_data.get("rirs", [])
     rir_name = rirs[0].get("rir", "N/A").upper() if rirs else "N/A"
 
-    # Data de alocação: extraída do WHOIS quando disponível
-    alloc_time = "N/A"
-    whois = _ripe_get("whois", {"resource": f"AS{asn_num}"})
-    for record_set in whois.get("records", []):
-        for field in record_set:
-            if str(field.get("key", "")).lower() in ("changed", "created"):
-                alloc_time = _fmt_date(field.get("value", ""))
-                break
-        if alloc_time != "N/A":
-            break
+    # Data de alocação via RDAP (funciona para todos os RIRs)
+    alloc_time = _rdap_alloc_date(asn_num)
 
     return {
         "holder":     overview.get("holder", "N/A"),
